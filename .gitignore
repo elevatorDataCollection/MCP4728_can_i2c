@@ -1,0 +1,50 @@
+################################
+# Build output (必须忽略)
+################################
+build/
+bin/
+obj/
+cmake-build-*/
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+
+################################
+# CMake / Ninja 中间文件
+################################
+CMakeCache.txt
+CMakeFiles/
+Testing/
+CTestTestfile.cmake
+cmake_install.cmake
+
+################################
+# STM32 / CubeMX 生成但可再生文件
+################################
+*.launch
+*.log
+
+################################
+# IDE / Editor (VS Code 特有)
+################################
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+.vscode/ipch/
+
+# 忽略 clangd 自动生成的索引文件夹（不要忽略 .clangd 配置文件本身）
+.clangd/
+.cache/
+
+# 其他 IDE 配置文件
+.settings/
+.project
+.cproject
+
+################################
+# 操作系统缓存文件
+################################
+.DS_Store
+Thumbs.db
