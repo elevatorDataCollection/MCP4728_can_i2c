@@ -2,8 +2,9 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Minimal offline calibration: MCP4728 4ch sync update (no CAN)
+  * @brief          : Elevator CAN to MCP4728 DAC Bridge
   ******************************************************************************
+  
   * @attention
   *
   * Copyright (c) 2026 STMicroelectronics.
@@ -18,9 +19,10 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "gpio.h"
+#include "can.h"
 #include "i2c.h"
-#include <stdint.h>
+#include "usart.h"
+#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -30,115 +32,56 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-// ======== Set your DAC output voltages here (Volts) ========
-#define VOUT_CH_A   (3.300f)   // CH-A 输出电压
-#define VOUT_CH_B   (1.650f)   // CH-B 输出电压
-#define VOUT_CH_C   (0.800f)   // CH-C 输出电压
-#define VOUT_CH_D   (2.500f)   // CH-D 输出电压
-
-// DAC reference voltage (usually VDD for MCP4728)
-#define DAC_VREF    (3.300f)   // 如果你的 MCP4728 供电不是 3.3V，请改这里
-
-// ======== MCP4728 I2C 7-bit address ========
-// 如果你扫描/确认的地址不是 0x60，把这里改成实际 7-bit 地址，8-bit 地址除以2即可为7-bit 地址
-#define MCP4728_ADDR_7BIT   (0x60)
-
-// ======== LDAC pin (sync update) ========
-// 你前面用 PA8 做 GPIO 输出非常合适：LDAC 接 PA8
-#define LDAC_GPIO_Port      GPIOA
-#define LDAC_Pin            GPIO_PIN_8
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-static inline void LDAC_High(void) { HAL_GPIO_WritePin(LDAC_GPIO_Port, LDAC_Pin, GPIO_PIN_SET); }
-static inline void LDAC_Low(void)  { HAL_GPIO_WritePin(LDAC_GPIO_Port, LDAC_Pin, GPIO_PIN_RESET); }
-
-static inline uint16_t clamp_u16(int32_t x, uint16_t lo, uint16_t hi)
-{
-  if (x < (int32_t)lo) return lo;
-  if (x > (int32_t)hi) return hi;
-  return (uint16_t)x;
-}
 
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-void SystemClock_Config(void);
 
 /* USER CODE BEGIN PV */
+
+// MCP4728 默认 I2C 地址 (0x60 左移一位)
+#define MCP4728_ADDR (0x60 << 1)
+
+// --- 4~20mA 映射用常数 ---
+// 假设硬件把 DAC (0~4095) 的输出电压(0~Vref)转换为 0~20mA
+// 所以 4mA 对应的 DAC 值为: (4mA/20mA) * 4095 ≈ 819，20mA对应 4095
+// (*如果您的硬件本身是将 0~Vref 转化为 4~20mA, 则此处应改为 0 和 4095)
+#define DAC_4MA_VAL  819
+#define DAC_20MA_VAL 4095
+
+// 定义 CAN 接收到数据的对应量程
+// 假设收到的数据是 0 到 10000 对应 4~20mA。(可根据您的电梯协议实际极值随意更改)
+#define SENSOR_MIN 0
+#define SENSOR_MAX 10000
+// -----------------------
+
+static volatile uint8_t dac_update_pending = 0;
+static volatile uint16_t dac_chA_pending = 0;
+static volatile uint16_t dac_chB_pending = 0;
+static volatile uint16_t dac_chC_pending = 0;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-
 /* USER CODE BEGIN PFP */
 
-static uint16_t volt_to_code(float v, float vref);
-static HAL_StatusTypeDef MCP4728_FastWrite4ch(uint16_t codeA, uint16_t codeB, uint16_t codeC, uint16_t codeD);
-static HAL_StatusTypeDef MCP4728_SyncUpdate4ch(uint16_t codeA, uint16_t codeB, uint16_t codeC, uint16_t codeD);
+void MCP4728_Write_3Channels(uint16_t chA, uint16_t chB, uint16_t chC);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-// 将目标电压转换为 12-bit DAC code (0..4095)
-static uint16_t volt_to_code(float v, float vref)
-{
-  if (vref <= 0.1f) vref = 3.3f;
-  if (v < 0.0f) v = 0.0f;
-  if (v > vref) v = vref;
-
-  float code_f = (v / vref) * 4095.0f;
-  int32_t code_i = (int32_t)(code_f + 0.5f);
-  return clamp_u16(code_i, 0, 4095);
-}
-
-// MCP4728 Fast Write: 4 channels, each 2 bytes
-// Byte0: [C1 C0 PD1 PD0 D11 D10 D9 D8]
-// Byte1: [D7..D0]
-// C1C0: 00=A, 01=B, 10=C, 11=D
-// PD=00: normal mode
-static HAL_StatusTypeDef MCP4728_FastWrite4ch(uint16_t codeA, uint16_t codeB, uint16_t codeC, uint16_t codeD)
-{
-  uint8_t buf[8];
-  uint16_t code[4] = {codeA, codeB, codeC, codeD};
-
-  for (int ch = 0; ch < 4; ch++) {
-    uint16_t v = code[ch] & 0x0FFF;                 // 12-bit
-    uint8_t high = (uint8_t)((v >> 8) & 0x0F);      // D11..D8
-    uint8_t low  = (uint8_t)(v & 0xFF);             // D7..D0
-
-    buf[ch*2 + 0] = (uint8_t)(((ch & 0x03) << 6) | (0x0 << 4) | high);
-    buf[ch*2 + 1] = low;
-  }
-
-  return HAL_I2C_Master_Transmit(&hi2c1, (uint16_t)(MCP4728_ADDR_7BIT << 1), buf, sizeof(buf), 50);
-}
-
-// 同步更新：LDAC 高锁住输出 → 写4通道 → LDAC 低脉冲 → 4通道同时更新
-static HAL_StatusTypeDef MCP4728_SyncUpdate4ch(uint16_t codeA, uint16_t codeB, uint16_t codeC, uint16_t codeD)
-{
-  LDAC_High();  // lock outputs
-
-  HAL_StatusTypeDef st = MCP4728_FastWrite4ch(codeA, codeB, codeC, codeD);
-  if (st != HAL_OK) return st;
-
-  LDAC_Low();
-  for (volatile int i = 0; i < 300; i++) { __NOP(); }  // short pulse
-  LDAC_High();
-
-  return HAL_OK;
-}
 /* USER CODE END 0 */
 
 /**
@@ -170,31 +113,52 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_CAN1_Init();
   MX_I2C1_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  
-  // 上电默认把 LDAC 拉高（防止写入过程中输出乱跳）
-  LDAC_High();
+  // 1. 配置 CAN 过滤器
+  CAN_FilterTypeDef sFilterConfig;
+  sFilterConfig.FilterBank = 0;
+  sFilterConfig.FilterMode = CAN_FILTERMODE_IDMASK;
+  sFilterConfig.FilterScale = CAN_FILTERSCALE_32BIT;
+  sFilterConfig.FilterIdHigh = (0x181 << 5);      // 帧 ID: 0x181
+  sFilterConfig.FilterIdLow = 0x0000;
+  sFilterConfig.FilterMaskIdHigh = 0xFFE0;        // 精确匹配
+  sFilterConfig.FilterMaskIdLow = 0x0000;
+  sFilterConfig.FilterFIFOAssignment = CAN_RX_FIFO0;
+  sFilterConfig.FilterActivation = ENABLE;
+  sFilterConfig.SlaveStartFilterBank = 14;
 
-  // 计算你设定的 4 路目标电压对应的 DAC code
-  uint16_t codeA = volt_to_code(VOUT_CH_A, DAC_VREF);
-  uint16_t codeB = volt_to_code(VOUT_CH_B, DAC_VREF);
-  uint16_t codeC = volt_to_code(VOUT_CH_C, DAC_VREF);
-  uint16_t codeD = volt_to_code(VOUT_CH_D, DAC_VREF);
+  if (HAL_CAN_ConfigFilter(&hcan1, &sFilterConfig) != HAL_OK) {
+      Error_Handler();
+  }
 
-  // 4 通道同步输出一次
-  (void)MCP4728_SyncUpdate4ch(codeA, codeB, codeC, codeD);
+  // 2. 启动 CAN
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+      Error_Handler();
+  }
 
+  // 3. 开启接收中断
+  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
+      Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    
-    HAL_Delay(1000);
-    /* USER CODE END WHILE */
+    if (dac_update_pending != 0U) {
+      uint16_t chA = dac_chA_pending;
+      uint16_t chB = dac_chB_pending;
+      uint16_t chC = dac_chC_pending;
 
+      dac_update_pending = 0U;
+      MCP4728_Write_3Channels(chA, chB, chC);
+    }
+    
+    /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
@@ -250,6 +214,63 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
+/**
+  * @brief 辅助映射函数：将 10 十进制的实际信号值线性映射入 4~20mA (默认 819~4095) 的 DAC 数据字
+  */
+static uint16_t Map_To_4_20mA(int32_t val) {
+    if (val <= SENSOR_MIN) return DAC_4MA_VAL;
+    if (val >= SENSOR_MAX) return DAC_20MA_VAL;
+    // 线性映射插值算法: 结果 = 最小值 + (当前-最小值) * (极差) / (满量程-最小值)
+    return DAC_4MA_VAL + (uint16_t)(((int64_t)(val - SENSOR_MIN) * (int64_t)(DAC_20MA_VAL - DAC_4MA_VAL)) / (SENSOR_MAX - SENSOR_MIN));
+}
+
+/**
+  * @brief CAN 接收回调：监听到电梯数据后直接输出到 DAC
+  */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+    CAN_RxHeaderTypeDef rxHeader;
+    uint8_t rxData[8];
+
+  if ((hcan->Instance == CAN1) && (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)) {
+    if ((rxHeader.StdId == 0x181U) && (rxHeader.DLC >= 8U)) {
+            // 将 16 进制存储格式转换为 10 进制整型变量的值
+            // 通道A: 前4个字节组成32位整型变量
+            int32_t rawA = (int32_t)(((uint32_t)rxData[0] << 24) | ((uint32_t)rxData[1] << 16) | ((uint32_t)rxData[2] << 8) | rxData[3]);
+            
+            // 通道B: 中间2个字节组成16位整型（如果有符号可转 (int16_t) ）
+            int32_t rawB = (int32_t)((rxData[4] << 8) | rxData[5]);
+            
+            // 通道C: 最后2个字节组成16位整型
+            int32_t rawC = (int32_t)((rxData[6] << 8) | rxData[7]);
+
+            // 通过映射公式，将 10进制变量 换算为 4-20mA 模拟电压对 DAC 的 12位 (819 - 4095)
+            uint16_t valA = Map_To_4_20mA(rawA);
+            uint16_t valB = Map_To_4_20mA(rawB);
+            uint16_t valC = Map_To_4_20mA(rawC);
+
+      dac_chA_pending = valA;
+      dac_chB_pending = valB;
+      dac_chC_pending = valC;
+      dac_update_pending = 1U;
+            
+            // 翻转 PA8 状态灯表示收到数据
+            HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_8);
+        }
+    }
+}
+
+/**
+  * @brief 向 MCP4728 发送 I2C 指令
+  */
+void MCP4728_Write_3Channels(uint16_t chA, uint16_t chB, uint16_t chC) {
+    uint8_t data[6];
+    // 通道 A, B, C 的多寄存器写入格式
+    data[0] = 0x40 | ((chA >> 8) & 0x0F); data[1] = chA & 0xFF;
+    data[2] = 0x42 | ((chB >> 8) & 0x0F); data[3] = chB & 0xFF;
+    data[4] = 0x44 | ((chC >> 8) & 0x0F); data[5] = chC & 0xFF;
+
+    HAL_I2C_Master_Transmit(&hi2c1, MCP4728_ADDR, data, 6, 50);
+}
 /* USER CODE END 4 */
 
 /**
