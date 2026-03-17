@@ -48,8 +48,8 @@
 
 /* USER CODE BEGIN PV */
 
-// MCP4728 默认 I2C 地址 (0x60 左移一位)
-#define MCP4728_ADDR (0x60 << 1)
+// MCP4728 默认 I2C 地址 (0x60 )
+#define MCP4728_ADDR (0x60 << 1) // 左移1位以适应 HAL 库的地址格式 (7位地址 + 1位读写)
 
 // --- 4~20mA 映射用常数 ---
 // 假设硬件把 DAC (0~4095) 的输出电压(0~Vref)转换为 0~20mA
@@ -62,6 +62,10 @@
 // 假设收到的数据是 0 到 10000 对应 4~20mA。(可根据您的电梯协议实际极值随意更改)
 #define SENSOR_MIN 0
 #define SENSOR_MAX 10000
+
+// MCP4728 LDAC 引脚：高电平保持输出不更新，低脉冲后同步更新各通道
+#define MCP4728_LDAC_GPIO_Port GPIOA
+#define MCP4728_LDAC_Pin GPIO_PIN_8
 // -----------------------
 
 static volatile uint8_t dac_update_pending = 0;
@@ -76,6 +80,7 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 
 void MCP4728_Write_3Channels(uint16_t chA, uint16_t chB, uint16_t chC);
+static void CAN_Send_Loopback_TestFrame(void);
 
 /* USER CODE END PFP */
 
@@ -149,6 +154,8 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    CAN_Send_Loopback_TestFrame();
+
     if (dac_update_pending != 0U) {
       uint16_t chA = dac_chA_pending;
       uint16_t chB = dac_chB_pending;
@@ -215,6 +222,47 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 
 /**
+  * @brief 环回调试发包：周期发送标准帧 0x181，数据格式为 A(4B)+B(2B)+C(2B)
+  */
+static void CAN_Send_Loopback_TestFrame(void) {
+  static uint32_t lastTickMs = 0U;
+
+  if ((HAL_GetTick() - lastTickMs) < 500U) {
+    return;
+  }
+  lastTickMs = HAL_GetTick();
+
+  /* 固定阶梯测试值：A=0、B=5000、C=10000 -> 理论 4mA/12mA/20mA */
+  const uint32_t a = 0U;
+  const uint16_t b = 5000U;
+  const uint16_t c = 10000U;
+
+  CAN_TxHeaderTypeDef txHeader = {0};
+  uint8_t txData[8];
+  uint32_t txMailbox = 0U;
+
+  txHeader.StdId = 0x181U;
+  txHeader.ExtId = 0U;
+  txHeader.IDE = CAN_ID_STD;
+  txHeader.RTR = CAN_RTR_DATA;
+  txHeader.DLC = 8U;
+  txHeader.TransmitGlobalTime = DISABLE;
+
+  txData[0] = (uint8_t)(a >> 24);
+  txData[1] = (uint8_t)(a >> 16);
+  txData[2] = (uint8_t)(a >> 8);
+  txData[3] = (uint8_t)(a);
+  txData[4] = (uint8_t)(b >> 8);
+  txData[5] = (uint8_t)(b);
+  txData[6] = (uint8_t)(c >> 8);
+  txData[7] = (uint8_t)(c);
+
+  if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0U) {
+    (void)HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, &txMailbox);
+  }
+}
+
+/**
   * @brief 辅助映射函数：将 10 十进制的实际信号值线性映射入 4~20mA (默认 819~4095) 的 DAC 数据字
   */
 static uint16_t Map_To_4_20mA(int32_t val) {
@@ -253,23 +301,47 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
       dac_chC_pending = valC;
       dac_update_pending = 1U;
             
-            // 翻转 PA8 状态灯表示收到数据
-            HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_8);
+            // 翻转 PA5 状态灯表示收到数据
+            HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
         }
     }
 }
 
 /**
-  * @brief 向 MCP4728 发送 I2C 指令
+  * @brief 向 MCP4728 发送 I2C 指令 (Multi-Write 连续写入模式)
   */
 void MCP4728_Write_3Channels(uint16_t chA, uint16_t chB, uint16_t chC) {
-    uint8_t data[6];
-    // 通道 A, B, C 的多寄存器写入格式
-    data[0] = 0x40 | ((chA >> 8) & 0x0F); data[1] = chA & 0xFF;
-    data[2] = 0x42 | ((chB >> 8) & 0x0F); data[3] = chB & 0xFF;
-    data[4] = 0x44 | ((chC >> 8) & 0x0F); data[5] = chC & 0xFF;
+    // 1个命令字节 + 3个通道 * 2字节(高低) = 7字节
+    uint8_t data[7];
 
-    HAL_I2C_Master_Transmit(&hi2c1, MCP4728_ADDR, data, 6, 50);
+    // 写入前保持 LDAC 为高，防止通道在传输过程中提前更新
+    HAL_GPIO_WritePin(MCP4728_LDAC_GPIO_Port, MCP4728_LDAC_Pin, GPIO_PIN_SET);
+
+    // 字节 0: Multi-Write 命令
+    // 格式: 0100 0 DAC1 DAC0 UD
+    // 0x40 = 0100 0000 -> 从通道A开始写入，UD=0 (立即更新)
+    // 0x41 = 0100 0001 -> 从通道A开始写入，UD=1 (挂起，等待 LDAC 引脚的低脉冲才更新)
+    data[0] = 0x41; 
+
+    // 通道 A: 高字节 (Vref=VDD, PD=Normal, Gain=1) 和 低字节
+    data[1] = (chA >> 8) & 0x0F; 
+    data[2] = chA & 0xFF;
+    
+    // 通道 B: 高字节和低字节
+    data[3] = (chB >> 8) & 0x0F; 
+    data[4] = chB & 0xFF;
+
+    // 通道 C: 高字节和低字节
+    data[5] = (chC >> 8) & 0x0F; 
+    data[6] = chC & 0xFF;
+
+    // 发送 7 个字节
+    if (HAL_I2C_Master_Transmit(&hi2c1, MCP4728_ADDR, data, 7, 50) == HAL_OK) {
+        // 给 LDAC 一个低脉冲，使 A/B/C 寄存器同步推送到物理输出引脚
+        HAL_GPIO_WritePin(MCP4728_LDAC_GPIO_Port, MCP4728_LDAC_Pin, GPIO_PIN_RESET);
+        // 恢复高电平
+        HAL_GPIO_WritePin(MCP4728_LDAC_GPIO_Port, MCP4728_LDAC_Pin, GPIO_PIN_SET);
+    }
 }
 /* USER CODE END 4 */
 
