@@ -23,6 +23,8 @@
 #include "i2c.h"
 #include "usart.h"
 #include "gpio.h"
+#include <stdio.h>
+#include <stdarg.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -73,6 +75,12 @@ static volatile uint16_t dac_chA_pending = 0;
 static volatile uint16_t dac_chB_pending = 0;
 static volatile uint16_t dac_chC_pending = 0;
 
+static volatile uint32_t g_can_tx_ok = 0U;
+static volatile uint32_t g_can_tx_fail = 0U;
+static volatile uint32_t g_can_rx_ok = 0U;
+static volatile uint32_t g_i2c_tx_ok = 0U;
+static volatile uint32_t g_i2c_tx_fail = 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -81,11 +89,32 @@ void SystemClock_Config(void);
 
 void MCP4728_Write_3Channels(uint16_t chA, uint16_t chB, uint16_t chC);
 static void CAN_Send_Loopback_TestFrame(void);
+static void Debug_Printf(const char *fmt, ...);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void Debug_Printf(const char *fmt, ...)
+{
+  char buf[160];
+  va_list args;
+
+  va_start(args, fmt);
+  int len = vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+
+  if (len <= 0) {
+    return;
+  }
+
+  if (len > (int)sizeof(buf)) {
+    len = (int)sizeof(buf);
+  }
+
+  (void)HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)len, 50U);
+}
 
 /* USER CODE END 0 */
 
@@ -148,12 +177,16 @@ int main(void)
   if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
       Error_Handler();
   }
+
+  Debug_Printf("[BOOT] CAN+I2C debug enabled\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    static uint32_t lastDebugTick = 0U;
+
     CAN_Send_Loopback_TestFrame();
 
     if (dac_update_pending != 0U) {
@@ -163,6 +196,16 @@ int main(void)
 
       dac_update_pending = 0U;
       MCP4728_Write_3Channels(chA, chB, chC);
+    }
+
+    if ((HAL_GetTick() - lastDebugTick) >= 1000U) {
+      lastDebugTick = HAL_GetTick();
+      Debug_Printf("[STAT] CAN_TX ok=%lu fail=%lu | CAN_RX=%lu | I2C ok=%lu fail=%lu\r\n",
+                   g_can_tx_ok,
+                   g_can_tx_fail,
+                   g_can_rx_ok,
+                   g_i2c_tx_ok,
+                   g_i2c_tx_fail);
     }
     
     /* USER CODE END WHILE */
@@ -233,9 +276,9 @@ static void CAN_Send_Loopback_TestFrame(void) {
   lastTickMs = HAL_GetTick();
 
   /* 固定阶梯测试值：A=0、B=5000、C=10000 -> 理论 4mA/12mA/20mA */
-  const uint32_t a = 0U;
+  const uint32_t a = 10000U;
   const uint16_t b = 5000U;
-  const uint16_t c = 10000U;
+  const uint16_t c = 0U;
 
   CAN_TxHeaderTypeDef txHeader = {0};
   uint8_t txData[8];
@@ -258,7 +301,13 @@ static void CAN_Send_Loopback_TestFrame(void) {
   txData[7] = (uint8_t)(c);
 
   if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0U) {
-    (void)HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, &txMailbox);
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, &txMailbox) == HAL_OK) {
+      g_can_tx_ok++;
+    } else {
+      g_can_tx_fail++;
+    }
+  } else {
+    g_can_tx_fail++;
   }
 }
 
@@ -281,6 +330,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
 
   if ((hcan->Instance == CAN1) && (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)) {
     if ((rxHeader.StdId == 0x181U) && (rxHeader.DLC >= 8U)) {
+            g_can_rx_ok++;
             // 将 16 进制存储格式转换为 10 进制整型变量的值
             // 通道A: 前4个字节组成32位整型变量
             int32_t rawA = (int32_t)(((uint32_t)rxData[0] << 24) | ((uint32_t)rxData[1] << 16) | ((uint32_t)rxData[2] << 8) | rxData[3]);
@@ -337,10 +387,13 @@ void MCP4728_Write_3Channels(uint16_t chA, uint16_t chB, uint16_t chC) {
 
     // 发送 7 个字节
     if (HAL_I2C_Master_Transmit(&hi2c1, MCP4728_ADDR, data, 7, 50) == HAL_OK) {
+    g_i2c_tx_ok++;
         // 给 LDAC 一个低脉冲，使 A/B/C 寄存器同步推送到物理输出引脚
         HAL_GPIO_WritePin(MCP4728_LDAC_GPIO_Port, MCP4728_LDAC_Pin, GPIO_PIN_RESET);
         // 恢复高电平
         HAL_GPIO_WritePin(MCP4728_LDAC_GPIO_Port, MCP4728_LDAC_Pin, GPIO_PIN_SET);
+  } else {
+    g_i2c_tx_fail++;
     }
 }
 /* USER CODE END 4 */
