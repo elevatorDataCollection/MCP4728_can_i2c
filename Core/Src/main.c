@@ -156,6 +156,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -307,9 +308,9 @@ static void CAN_Send_Loopback_TestFrame(void) {
   lastTickMs = HAL_GetTick();
 
   /* 固定阶梯测试值：A=0、B=5000、C=10000 -> 理论 20mA/12mA/4mA */
-  const uint32_t a = 10000U;
+  const uint32_t a = 0U;
   const uint16_t b = 5000U;
-  const uint16_t c = 0U;
+  const uint16_t c = 10000U;
 
   CAN_TxHeaderTypeDef txHeader = {0};
   uint8_t txData[8];
@@ -404,39 +405,35 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
   *
   * 帧格式 (datasheet §5.6.2 Sequential Write):
   *   Byte 0: 0x50  = 0101_0000  命令字，从 Ch.A 开始顺序写
-  *   Byte 1: 0x90 | (D11~D8)   Ch.A 高字节: bit7=1, VRef=VDD(0), PD=Normal(00), Gain=x1(0), D11-8
+  *   Byte 1: cfg  | (D11~D8)   Ch.A 高字节: VRef=VDD(0), PD=Normal(00), Gain=x1(0), D11-8
   *   Byte 2: D7~D0             Ch.A 低字节
-  *   Byte 3: 0x90 | (D11~D8)   Ch.B 高字节 (同上)
+  *   Byte 3: cfg  | (D11~D8)   Ch.B 高字节 (同上)
   *   Byte 4: D7~D0             Ch.B 低字节
-  *   Byte 5: 0x90 | (D11~D8)   Ch.C 高字节 (同上)
+  *   Byte 5: cfg  | (D11~D8)   Ch.C 高字节 (同上)
   *   Byte 6: D7~D0             Ch.C 低字节
   *
-  *   0x90 = 1001_0000
-  *          ││││└─── Gain  = x1
-  *          │││└──── PD0   = Normal
-  *          ││└───── PD1   = Normal
-  *          │└────── VRef  = VDD (使用 VDD 为参考电压)
-  *          └─────── 高字节标志 (固定为 1)
+  *   cfg = 0x00 时表示: VRef=VDD, PD=Normal, Gain=x1
   *
   * LDAC 时序: 先完成 I2C 传输，再给低脉冲触发三通道同步更新输出。
   */
 void MCP4728_Write_3Channels(uint16_t chA, uint16_t chB, uint16_t chC) {
     // 1个命令字节 + 3个通道 × 2字节 = 7字节
     uint8_t data[7];
+  const uint8_t cfg = 0x00U; // Vref=VDD, PD=Normal, Gain=x1
  
     // Byte 0: Sequential Write 命令，从 Ch.A 开始
     data[0] = 0x50;
  
     // Byte 1~2: 通道 A
-    data[1] = 0x90 | ((chA >> 8) & 0x0F);  // 高字节: 控制位 + D11~D8
+  data[1] = cfg | ((chA >> 8) & 0x0F);   // 高字节: 配置位 + D11~D8
     data[2] = chA & 0xFF;                   // 低字节: D7~D0
  
     // Byte 3~4: 通道 B
-    data[3] = 0x90 | ((chB >> 8) & 0x0F);  // 高字节: 控制位 + D11~D8
+  data[3] = cfg | ((chB >> 8) & 0x0F);   // 高字节: 配置位 + D11~D8
     data[4] = chB & 0xFF;                   // 低字节: D7~D0
  
     // Byte 5~6: 通道 C
-    data[5] = 0x90 | ((chC >> 8) & 0x0F);  // 高字节: 控制位 + D11~D8
+  data[5] = cfg | ((chC >> 8) & 0x0F);   // 高字节: 配置位 + D11~D8
     data[6] = chC & 0xFF;                   // 低字节: D7~D0
  
 #if DEBUG_UART_ENABLE && DEBUG_I2C_VERBOSE
