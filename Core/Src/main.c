@@ -21,11 +21,8 @@
 #include "main.h"
 #include "can.h"
 #include "i2c.h"
-#include "stm32f4xx_hal.h"
 #include "usart.h"
 #include "gpio.h"
-#include <stdio.h>
-#include <stdarg.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -163,7 +160,6 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -181,8 +177,7 @@ int main(void)
   MX_GPIO_Init();
   MX_CAN1_Init();
   MX_I2C1_Init();
-  /* 串口调试关闭 */
-  /* MX_USART2_UART_Init(); */
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   // 1. 配置 CAN 过滤器
   CAN_FilterTypeDef sFilterConfig;
