@@ -63,9 +63,9 @@
 #define DAC_20MA_VAL 4095
 
 // 定义 CAN 接收到数据的对应量程
-// 假设收到的数据是 0 到 10000 对应 4~20mA。(可根据您的电梯协议实际极值随意更改)
+// 假设收到的数据是 0 到 60000 对应 4~20mA。(可根据您的电梯协议实际极值随意更改)
 #define SENSOR_MIN 0
-#define SENSOR_MAX 10000
+#define SENSOR_MAX 60000
 
 // MCP4728 LDAC 引脚：高电平保持输出不更新，低脉冲后同步更新各通道
 #define MCP4728_LDAC_GPIO_Port GPIOA
